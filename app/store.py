@@ -271,10 +271,12 @@ class Store:
                 body = json.dumps(rules, sort_keys=True)
                 rid = revision_id(rules)
                 if active is None:
-                    # Bootstrap: legacy PUT creates the first active revision.
+                    # Bootstrap: legacy PUT publishes the first revision.  A
+                    # never-activated draft of the same content may already
+                    # own the revision row, so the insert is idempotent.
                     now = _now()
                     conn.execute(
-                        "INSERT INTO ruleset_revisions"
+                        "INSERT OR IGNORE INTO ruleset_revisions"
                         "(ruleset_name, revision, body, content_hash, base_revision, created_at)"
                         " VALUES (?,?,?,?,NULL,?)",
                         (name, rid, body, stable_hash(rules), now),
@@ -378,38 +380,120 @@ class Store:
         )
 
     def create_ruleset_revision(self, name, rules, base_revision):
-        """Create a content-deduplicated draft (or bootstrap the ruleset).
+        """Create a content-deduplicated, immutable *draft* revision.
+
+        A draft only appends to ``ruleset_revisions``: it never touches the
+        active pointer, the activation audit or the legacy ``rulesets``
+        mirror, so legacy GET and named accounting cannot observe it.  It
+        becomes effective through a separate CAS activation.
 
         Optimistic concurrency: ``base_revision`` must equal the active
-        revision as of the transaction start; for a not-yet-existing
-        ruleset it must be ``None`` (the first revision is activated at
-        once).  An expired baseline raises ConflictError.
+        revision as of the transaction start; for a not-yet-published
+        ruleset it must be ``None`` (there is no active revision to base
+        on).  An expired baseline raises ConflictError.
         """
         with self._lock:
             conn = self._connect()
             try:
                 conn.execute("BEGIN IMMEDIATE")
                 active = self._active_row(conn, name)
+                active_rev = active["revision"] if active is not None else None
                 body = json.dumps(rules, sort_keys=True)
                 rid = revision_id(rules)
                 now = _now()
-                if active is None:
-                    if base_revision is not None:
-                        raise ConflictError(
-                            "stale base_revision for %r: ruleset does not exist yet"
-                            % name,
-                            {
-                                "reason": "stale-base",
-                                "base_revision": base_revision,
-                                "active_revision": None,
-                            },
-                        )
+                if active_rev != base_revision:
+                    raise ConflictError(
+                        "stale base_revision for %r: active revision is %r"
+                        % (name, active_rev),
+                        {
+                            "reason": "stale-base",
+                            "base_revision": base_revision,
+                            "active_revision": active_rev,
+                        },
+                    )
+                existing = conn.execute(
+                    "SELECT created_at, base_revision FROM ruleset_revisions"
+                    " WHERE ruleset_name = ? AND revision = ?",
+                    (name, rid),
+                ).fetchone()
+                if existing is None:
                     conn.execute(
                         "INSERT INTO ruleset_revisions"
                         "(ruleset_name, revision, body, content_hash, base_revision, created_at)"
-                        " VALUES (?,?,?,?,NULL,?)",
-                        (name, rid, body, stable_hash(rules), now),
+                        " VALUES (?,?,?,?,?,?)",
+                        (name, rid, body, stable_hash(rules), base_revision, now),
                     )
+                    created, stored_base, stored_at = True, base_revision, now
+                else:
+                    # Identical normalized content collapses onto the same
+                    # immutable revision row (a re-submitted draft included).
+                    created = False
+                    stored_base = existing["base_revision"]
+                    stored_at = existing["created_at"]
+                conn.commit()
+                return {
+                    "name": name,
+                    "revision": rid,
+                    "content_hash": stable_hash(rules),
+                    "base_revision": stored_base,
+                    "created_at": stored_at,
+                    "active": rid == active_rev,
+                    "created": created,
+                }
+            except Exception:
+                conn.rollback()
+                raise
+            finally:
+                conn.close()
+
+    def activate_ruleset_revision(self, name, rid, expected_active):
+        """Atomically switch (or set) the active revision via compare-and-set.
+
+        The active revision is (re-)read inside one transaction and the
+        switch, its audit row and the previous-revision provenance all
+        commit together, along with the legacy ``rulesets`` mirror sync.
+        A lost race (the active revision moved since the caller fetched
+        it, or another transaction published the first revision while
+        this one still expected ``None``) raises ConflictError and changes
+        nothing.  Activating the revision already active is idempotent and
+        adds no audit row.
+        """
+        with self._lock:
+            conn = self._connect()
+            try:
+                conn.execute("BEGIN IMMEDIATE")
+                active = self._active_row(conn, name)
+                current = active["revision"] if active is not None else None
+                target = conn.execute(
+                    "SELECT body FROM ruleset_revisions WHERE ruleset_name = ? AND revision = ?",
+                    (name, rid),
+                ).fetchone()
+                if target is None:
+                    # Distinguish a never-drafted name (404 ruleset) from a
+                    # merely unknown revision of an existing ruleset.
+                    any_rev = conn.execute(
+                        "SELECT 1 FROM ruleset_revisions WHERE ruleset_name = ?",
+                        (name,),
+                    ).fetchone()
+                    if any_rev is None:
+                        raise NotFound("ruleset %r not found" % name)
+                    raise NotFound(
+                        "revision %r of ruleset %r not found" % (rid, name)
+                    )
+                if current != expected_active:
+                    raise ConflictError(
+                        "expected active revision %r but it is %r"
+                        % (expected_active, current),
+                        {
+                            "reason": "active-moved",
+                            "expected_active_revision": expected_active,
+                            "active_revision": current,
+                        },
+                    )
+                now = _now()
+                if current is None:
+                    # First publish: create the pointer and the first audit
+                    # row, and mirror the content for legacy GET/PUT users.
                     conn.execute(
                         "INSERT INTO ruleset_active(ruleset_name, revision, activated_at)"
                         " VALUES (?,?,?)",
@@ -424,82 +508,18 @@ class Store:
                     conn.execute(
                         "INSERT OR REPLACE INTO rulesets(name, body, created_at)"
                         " VALUES (?,?,?)",
-                        (name, body, now),
+                        (name, target["body"], now),
                     )
-                    created, activated = True, True
-                    stored_base, stored_at = None, now
-                else:
-                    if base_revision != active["revision"]:
-                        raise ConflictError(
-                            "stale base_revision for %r: active revision is %r"
-                            % (name, active["revision"]),
-                            {
-                                "reason": "stale-base",
-                                "base_revision": base_revision,
-                                "active_revision": active["revision"],
-                            },
-                        )
-                    existing = conn.execute(
-                        "SELECT created_at, base_revision FROM ruleset_revisions"
-                        " WHERE ruleset_name = ? AND revision = ?",
-                        (name, rid),
-                    ).fetchone()
-                    if existing is None:
-                        conn.execute(
-                            "INSERT INTO ruleset_revisions"
-                            "(ruleset_name, revision, body, content_hash, base_revision, created_at)"
-                            " VALUES (?,?,?,?,?,?)",
-                            (name, rid, body, stable_hash(rules), base_revision, now),
-                        )
-                        created, stored_base, stored_at = True, base_revision, now
-                    else:
-                        created = False
-                        stored_base = existing["base_revision"]
-                        stored_at = existing["created_at"]
-                    activated = rid == active["revision"]
-                conn.commit()
-                return {
-                    "name": name,
-                    "revision": rid,
-                    "content_hash": stable_hash(rules),
-                    "base_revision": stored_base,
-                    "created_at": stored_at,
-                    "active": activated,
-                    "created": created,
-                }
-            except Exception:
-                conn.rollback()
-                raise
-            finally:
-                conn.close()
-
-    def activate_ruleset_revision(self, name, rid, expected_active):
-        """Atomically switch the active revision via compare-and-set.
-
-        The active revision is (re-)read inside one transaction and the
-        switch, its audit row and the previous-revision provenance all
-        commit together.  A lost race (active moved since the caller
-        fetched it) raises ConflictError and changes nothing.  Activating
-        the revision already active is idempotent and adds no audit row.
-        """
-        with self._lock:
-            conn = self._connect()
-            try:
-                conn.execute("BEGIN IMMEDIATE")
-                active = self._active_row(conn, name)
-                if active is None:
-                    raise NotFound("ruleset %r not found" % name)
-                if active["revision"] != expected_active:
-                    raise ConflictError(
-                        "expected active revision %r but it is %r"
-                        % (expected_active, active["revision"]),
-                        {
-                            "reason": "active-moved",
-                            "expected_active_revision": expected_active,
-                            "active_revision": active["revision"],
-                        },
-                    )
-                if active["revision"] == rid:
+                    conn.commit()
+                    return {
+                        "name": name,
+                        "revision": rid,
+                        "active_revision": rid,
+                        "activated": True,
+                        "previous_revision": None,
+                        "activated_at": now,
+                    }
+                if current == rid:
                     result = {
                         "name": name,
                         "revision": rid,
@@ -510,25 +530,16 @@ class Store:
                     }
                     conn.commit()
                     return result
-                target = conn.execute(
-                    "SELECT body FROM ruleset_revisions WHERE ruleset_name = ? AND revision = ?",
-                    (name, rid),
-                ).fetchone()
-                if target is None:
-                    raise NotFound(
-                        "revision %r of ruleset %r not found" % (rid, name)
-                    )
-                now = _now()
                 conn.execute(
                     "UPDATE ruleset_active SET revision = ?, activated_at = ?"
                     " WHERE ruleset_name = ? AND revision = ?",
-                    (rid, now, name, active["revision"]),
+                    (rid, now, name, current),
                 )
                 conn.execute(
                     "INSERT INTO ruleset_activations"
                     "(ruleset_name, revision, previous_revision, activated_at)"
                     " VALUES (?,?,?,?)",
-                    (name, rid, active["revision"], now),
+                    (name, rid, current, now),
                 )
                 conn.execute(
                     "INSERT OR REPLACE INTO rulesets(name, body, created_at)"
@@ -541,7 +552,7 @@ class Store:
                     "revision": rid,
                     "active_revision": rid,
                     "activated": True,
-                    "previous_revision": active["revision"],
+                    "previous_revision": current,
                     "activated_at": now,
                 }
             except Exception:
@@ -551,18 +562,25 @@ class Store:
                 conn.close()
 
     def list_ruleset_revisions(self, name):
-        """Return the immutable revision history plus activation records."""
+        """Return the immutable revision history plus activation records.
+
+        A ruleset that has drafts but no published revision is still
+        returned (``active_revision`` is ``None`` and the activation
+        chain is empty); only a name with no revisions at all yields
+        ``None``.
+        """
         conn = self._connect()
         try:
             active = self._active_row(conn, name)
-            if active is None:
-                return None
+            active_rev = active["revision"] if active is not None else None
             revs = conn.execute(
                 "SELECT revision, body, content_hash, base_revision, created_at"
                 " FROM ruleset_revisions WHERE ruleset_name = ?"
                 " ORDER BY seq",
                 (name,),
             ).fetchall()
+            if not revs:
+                return None
             activations = conn.execute(
                 "SELECT revision, previous_revision, activated_at"
                 " FROM ruleset_activations WHERE ruleset_name = ?"
@@ -573,13 +591,13 @@ class Store:
             conn.close()
         return {
             "name": name,
-            "active_revision": active["revision"],
+            "active_revision": active_rev,
             "revisions": [
                 {
                     "revision": r["revision"],
                     "content_hash": r["content_hash"],
                     "base_revision": r["base_revision"],
-                    "active": r["revision"] == active["revision"],
+                    "active": r["revision"] == active_rev,
                     "created_at": r["created_at"],
                     "ruleset": json.loads(r["body"]),
                 }

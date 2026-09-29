@@ -2401,12 +2401,16 @@ def run_compare_checks(call, check):
 def run_revision_checks():
     """Exercise immutable revisions end to end.
 
-    Covers: content-hash identity, draft deduplication, optimistic
-    base_revision (409 stale-base), compare-and-set activation
-    (409 active-moved), in-transaction active-revision read for
-    assessments, history listing, old-revision rollback via the same CAS
-    flow, history immutability, unknown-revision handling, a real
-    activation race between two threads, and fresh-DB revision seeding.
+    Covers: content-hash identity, the first revision staying an
+    unpublished draft (invisible to legacy GET, ruleset listing and named
+    accounting; history reports active_revision null), first publish via
+    CAS with expected_active_revision null, draft deduplication,
+    optimistic base_revision (409 stale-base), compare-and-set
+    activation (409 active-moved), in-transaction active-revision read
+    for assessments, history listing, old-revision rollback via the same
+    CAS flow, history immutability, unknown-revision handling, real
+    activation races (later and first publishes) between two threads, and
+    fresh-DB revision seeding.
     """
     v1 = {"licenses": {"Z-1.0": {"obligations": ["attribution"]}}}
     v2 = {"licenses": {"Z-1.0": {"obligations": ["attribution", "license-text"]}}}
@@ -2415,13 +2419,15 @@ def run_revision_checks():
         "combined_work_linkages": ["dynamic", "static"],
     }
 
-    # bootstrap: base_revision null creates the ruleset and activates at once
+    # first revision with base_revision null only SAVES an immutable draft:
+    # no active pointer, no activation audit and no legacy mirror
     code, body = call("POST", "/v1/rulesets/revset/revisions",
                       {"rules": v1, "base_revision": None})
     r1 = body.get("revision")
     check(
-        "revision: bootstrap first revision",
-        code == 200 and body.get("created") is True and body.get("active") is True
+        "revision: first revision is an unpublished draft",
+        code == 200 and body.get("created") is True and body.get("active") is False
+        and body.get("base_revision") is None
         and r1 is not None and len(r1) == 16,
         json.dumps(body)[:200],
     )
@@ -2430,6 +2436,77 @@ def run_revision_checks():
         r1 == stable_hash(validate_ruleset(v1))[:16]
         and body.get("content_hash") == stable_hash(validate_ruleset(v1)),
     )
+
+    # re-submitting the identical first draft deduplicates, stays unpublished
+    code, body_again = call("POST", "/v1/rulesets/revset/revisions",
+                            {"rules": v1, "base_revision": None})
+    check(
+        "revision: re-submitted first draft deduplicated",
+        code == 200 and body_again.get("created") is False
+        and body_again.get("revision") == r1 and body_again.get("active") is False,
+        json.dumps(body_again)[:200],
+    )
+
+    # draft stage: legacy GET, the ruleset listing and named accounting must
+    # not observe the ruleset; its history exists with a null active revision
+    code, body = call("GET", "/v1/rulesets/revset")
+    check("revision: legacy GET hides unpublished draft", code == 404)
+    code, body = call("GET", "/v1/rulesets")
+    check(
+        "revision: ruleset listing excludes unpublished draft",
+        code == 200 and "revset" not in body.get("rulesets", []),
+    )
+    code, hist = call("GET", "/v1/rulesets/revset/revisions")
+    check(
+        "revision: draft history has null active revision and no audits",
+        code == 200 and hist.get("active_revision") is None
+        and [r["revision"] for r in hist.get("revisions", [])] == [r1]
+        and hist["revisions"][0]["active"] is False
+        and hist.get("activations") == [],
+        json.dumps(hist)[:200],
+    )
+    code, body = call("POST", "/v1/assessments",
+                      {"product": "revprod", "ruleset": "revset",
+                       "components": [{"id": "z", "license": "Z-1.0"}]})
+    check("revision: named assessment against unpublished draft -> 404",
+          code == 404)
+
+    # first publish goes through the CAS activate endpoint with a null
+    # expectation; a non-null expectation loses the compare-and-set and
+    # publishes nothing
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r1,
+                      {"expected_active_revision": "0" * 16})
+    check(
+        "revision: first publish with stale non-null expectation -> 409",
+        code == 409 and body.get("reason") == "active-moved"
+        and body.get("expected_active_revision") == "0" * 16
+        and body.get("active_revision") is None,
+        json.dumps(body)[:200],
+    )
+    code, hist = call("GET", "/v1/rulesets/revset/revisions")
+    check("revision: failed first publish leaves no audit",
+          hist.get("active_revision") is None
+          and hist.get("activations") == [])
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r1,
+                      {"expected_active_revision": None})
+    check(
+        "revision: first publish via CAS with null expectation",
+        code == 200 and body.get("active_revision") == r1
+        and body.get("activated") is True
+        and body.get("previous_revision") is None
+        and body.get("activated_at"),
+        json.dumps(body)[:200],
+    )
+    # legacy GET and listing observe the ruleset only after the publish
+    code, body = call("GET", "/v1/rulesets/revset")
+    check(
+        "revision: legacy GET follows first publish",
+        code == 200 and body.get("ruleset") == validate_ruleset(v1)
+        and body.get("active_revision") == r1,
+    )
+    code, body = call("GET", "/v1/rulesets")
+    check("revision: ruleset listing includes published ruleset",
+          code == 200 and "revset" in body.get("rulesets", []))
 
     # normalized-identical payloads collapse onto the same revision
     code, body_same = call("POST", "/v1/rulesets/revset/revisions",
@@ -2440,14 +2517,6 @@ def run_revision_checks():
         and body_same.get("revision") == r1
         and body_same.get("active") is True,
         json.dumps(body_same)[:200],
-    )
-
-    # legacy GET stays compatible and reports the active revision
-    code, body = call("GET", "/v1/rulesets/revset")
-    check(
-        "revision: legacy GET compatible with active revision",
-        code == 200 and body.get("ruleset") == validate_ruleset(v1)
-        and body.get("active_revision") == r1,
     )
 
     # a draft of new content is created but not activated
@@ -2480,6 +2549,9 @@ def run_revision_checks():
     code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
                       {})
     check("revision: missing expected_active_revision -> 400", code == 400)
+    code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
+                      {"expected_active_revision": 123})
+    check("revision: mistyped expected_active_revision -> 400", code == 400)
     code, body = call("POST", "/v1/rulesets/revset/revisions/%s/activate" % r2,
                       {"expected_active_revision": "0" * 16})
     check(
@@ -2601,7 +2673,8 @@ def run_revision_checks():
     # unknown ruleset history -> 404
     code, body = call("GET", "/v1/rulesets/no-such-rs/revisions")
     check("revision: history of unknown ruleset -> 404", code == 404)
-    # drafting for a not-yet-existing ruleset requires base_revision null
+    # drafting for a not-yet-existing ruleset requires base_revision null,
+    # and the draft stays unpublished until an explicit first activation
     code, body = call("POST", "/v1/rulesets/brandnew/revisions",
                       {"rules": v1, "base_revision": r1})
     check(
@@ -2611,8 +2684,112 @@ def run_revision_checks():
     )
     code, body = call("POST", "/v1/rulesets/brandnew/revisions",
                       {"rules": v1, "base_revision": None})
-    check("revision: bootstrap via revisions endpoint",
-          code == 200 and body.get("active") is True)
+    b1 = body.get("revision")
+    check(
+        "revision: first revision via revisions endpoint stays a draft",
+        code == 200 and body.get("active") is False
+        and body.get("base_revision") is None and b1 is not None,
+    )
+    code, body = call("GET", "/v1/rulesets/brandnew")
+    check("revision: unpublished brandnew hidden from legacy GET", code == 404)
+    code, hist = call("GET", "/v1/rulesets/brandnew/revisions")
+    check(
+        "revision: brandnew draft history has null active revision",
+        code == 200 and hist.get("active_revision") is None
+        and hist.get("activations") == []
+        and [r["revision"] for r in hist["revisions"]] == [b1],
+    )
+    # activating an unknown revision of a draft-only ruleset -> 404
+    code, body = call(
+        "POST", "/v1/rulesets/brandnew/revisions/%s/activate" % ("a" * 16),
+        {"expected_active_revision": None})
+    check("revision: unknown revision of draft-only ruleset -> 404", code == 404)
+    code, body = call(
+        "POST", "/v1/rulesets/brandnew/revisions/%s/activate" % b1,
+        {"expected_active_revision": None})
+    check(
+        "revision: brandnew first publish via null CAS expectation",
+        code == 200 and body.get("active_revision") == b1
+        and body.get("activated") is True
+        and body.get("previous_revision") is None,
+    )
+    code, body = call(
+        "POST", "/v1/rulesets/brandnew/revisions/%s/activate" % b1,
+        {"expected_active_revision": b1})
+    check(
+        "revision: brandnew re-activation is idempotent",
+        code == 200 and body.get("activated") is False,
+    )
+    code, hist = call("GET", "/v1/rulesets/brandnew/revisions")
+    check(
+        "revision: brandnew has exactly one first-publish audit",
+        hist.get("active_revision") == b1 and len(hist.get("activations", [])) == 1
+        and hist["activations"][0]["previous_revision"] is None,
+    )
+
+    # legacy PUT stays able to publish a draft-only name created via revisions
+    code, body = call("POST", "/v1/rulesets/legacyboot/revisions",
+                      {"rules": v2, "base_revision": None})
+    lb = body["revision"]
+    check("revision: draft-only name before legacy PUT is hidden",
+          call("GET", "/v1/rulesets/legacyboot")[0] == 404)
+    code, body = call("PUT", "/v1/rulesets/legacyboot", v2)
+    check(
+        "revision: legacy PUT publishes draft-only ruleset",
+        code == 200 and body.get("created") is True
+        and call("GET", "/v1/rulesets/legacyboot")[1].get("active_revision") == lb,
+    )
+    hist = call("GET", "/v1/rulesets/legacyboot/revisions")[1]
+    check(
+        "revision: legacy PUT publish reuses draft row, one audit",
+        [r["revision"] for r in hist["revisions"]] == [lb]
+        and len(hist["activations"]) == 1,
+    )
+
+    # -- real concurrency: two first-publish activations, one wins ----------
+    code, fp = call("POST", "/v1/rulesets/firstrace/revisions",
+                    {"rules": v1, "base_revision": None})
+    first_target = fp["revision"]
+    outcome = {}
+
+    def first_activate(tag):
+        # Both threads CAS expecting null (no active revision yet).
+        c, b = call(
+            "POST",
+            "/v1/rulesets/firstrace/revisions/%s/activate" % first_target,
+            {"expected_active_revision": None})
+        outcome[tag] = (c, b)
+
+    th1 = threading.Thread(target=first_activate, args=("a",))
+    th2 = threading.Thread(target=first_activate, args=("b",))
+    th1.start(); th2.start(); th1.join(); th2.join()
+    codes = sorted(outcome[k][0] for k in outcome)
+    check(
+        "revision: racing first publishes -> exactly one wins",
+        codes == [200, 409],
+        str({k: v[0] for k, v in outcome.items()}),
+    )
+    loser = [k for k, v in outcome.items() if v[0] == 409][0]
+    check(
+        "revision: first-publish loser sees active-moved with winner revision",
+        outcome[loser][1].get("reason") == "active-moved"
+        and outcome[loser][1].get("expected_active_revision") is None
+        and outcome[loser][1].get("active_revision") == first_target,
+        json.dumps(outcome[loser][1])[:200],
+    )
+    hist = call("GET", "/v1/rulesets/firstrace/revisions")[1]
+    check(
+        "revision: first-publish race leaves a single audit row",
+        hist.get("active_revision") == first_target
+        and len(hist.get("activations", [])) == 1
+        and hist["activations"][0]["previous_revision"] is None,
+    )
+    # loser retries with the now-current expectation: idempotent no-op
+    code, body = call(
+        "POST", "/v1/rulesets/firstrace/revisions/%s/activate" % first_target,
+        {"expected_active_revision": first_target})
+    check("revision: first-publish loser retries idempotently",
+          code == 200 and body.get("activated") is False)
 
     # -- real concurrency: two activations racing, exactly one wins ---------
     race_v1 = {"licenses": {"Q-1.0": {"obligations": ["attribution"]}}}

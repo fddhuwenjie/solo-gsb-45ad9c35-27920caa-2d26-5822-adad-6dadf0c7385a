@@ -65,8 +65,9 @@ class Api:
 
     def get_ruleset(self, name):
         history = self.store.list_ruleset_revisions(name)
-        if history is None:
-            # Pre-revision mirror fallback.
+        if history is None or history["active_revision"] is None:
+            # Drafts are invisible to legacy consumers: a name with no
+            # published revision behaves like a missing ruleset.
             rules = self.store.get_ruleset(name)
             if rules is None:
                 raise NotFound("ruleset %r not found" % name)
@@ -101,10 +102,17 @@ class Api:
     def activate_revision(self, name, revision, body):
         if not isinstance(body, dict):
             raise ClientError("request body must be a JSON object")
-        expected = body.get("expected_active_revision")
-        if not isinstance(expected, str) or not expected:
+        if "expected_active_revision" not in body:
             raise ClientError(
-                "activation requires a non-empty 'expected_active_revision' string"
+                "activation requires 'expected_active_revision'"
+                " (null when publishing the ruleset's first revision)"
+            )
+        expected = body["expected_active_revision"]
+        if expected is not None and not (
+            isinstance(expected, str) and expected
+        ):
+            raise ClientError(
+                "'expected_active_revision' must be a non-empty string or null"
             )
         return self.store.activate_ruleset_revision(name, revision, expected)
 
