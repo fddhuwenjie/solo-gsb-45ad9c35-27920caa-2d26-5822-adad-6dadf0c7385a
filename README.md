@@ -28,7 +28,7 @@ python3 main.py
 数据持久化在 SQLite（容器内 `/data/app.db`，本地默认 `./data/app.db`，
 环境变量 `APP_DB` 可改）。
 
-自检（启动临时实例跑 271 项端到端检查）：
+自检（启动临时实例跑 295 项端到端检查）：
 
 ```bash
 python3 tests/selftest.py
@@ -54,23 +54,41 @@ python3 tests/selftest.py
 | POST | `/v1/assessments/{id}/responsibility-plan` | 义务责任分工（执行/复核） |
 | POST | `/v1/assessments/compare` | 两次核算的原子差异与最小归因对比 |
 
-### 不可变修订与原子发布（含并发发布与回滚）
+### 不可变修订与原子发布（草稿门禁、并发发布与回滚）
 
 规则集的每次内容都是一条**不可变修订**：修订 id 是规范化内容的 SHA-256
 前 16 位（完整哈希在 `content_hash` 给出）。内容相同（规范化后）的多次提交
-折叠到同一条修订，历史内容**绝不覆盖、绝不删除**。发布 = 在一个事务里把
-“活动修订”指针从旧修订切到目标修订，配合两处乐观并发控制：
+折叠到同一条修订，历史内容**绝不覆盖、绝不删除**。
+
+**发布门禁（首版只存草稿）**：规则集的第一条修订**不会自动发布**——
+`POST /v1/rulesets/{name}/revisions` 在名称从未存在且 `base_revision:null`
+时，只写入一条不可变草稿，并用一个 `revision/activated_at` 均为 `NULL`
+的占位指针**预留该名称**；此时不写活动指针内容、不写激活审计、不同步旧
+`rulesets` 镜像，响应为 `"active": false`，历史返回
+`"active_revision": null`。草稿对旧接口与核算完全不可见：
+
+- `GET /v1/rulesets/{name}`（旧 GET）对仅有草稿的名称返回 **404**，
+  `GET /v1/rulesets` 列表中也没有该名称；
+- 命名规则集核算（`POST /v1/assessments` 的 `"ruleset"`）对仅有草稿的名称
+  返回 **404**——未经发布的规则绝不参与核算。
+
+发布 = 在一个事务里把“活动修订”指针填充/切换到目标修订，配合两处乐观
+并发控制：
 
 - `POST /v1/rulesets/{name}/revisions` 生成草稿，必须携带 `base_revision`
-  （客户端所依据的活动修订；**规则集首次创建时传 `null`**）。服务端在
-  事务开始时读取活动修订，若已不等于 `base_revision`（基线过期）返回
-  **409**，响应体给出 `reason: "stale-base"` 与当前 `active_revision`。
-- `POST .../revisions/{revision}/activate` 激活草稿（或任意旧修订），必须
-  携带 `expected_active_revision`。服务端在**同一事务**内重读活动修订并
-  完成指针切换、审计记录与镜像更新；活动修订已被他人改变时返回 **409**
-  （`reason: "active-moved"`，附当前活动修订），整笔切换不发生。
+  （客户端所依据的修订）。**规则集的第一条草稿传 `null`**；规则集已有草稿
+  但尚未发布时，后续草稿必须以该规则集**一条已存在的修订**为基线（仍是
+  未发布草稿）；已发布后则必须等于事务开始时的活动修订。基线不成立（过期
+  或不存在）返回 **409**，响应体给出 `reason: "stale-base"` 与当前
+  `active_revision`（首版发布前为 `null`）。
+- `POST .../revisions/{revision}/activate` 发布/激活草稿（或任意旧修订），
+  必须携带 `expected_active_revision`：**首次发布传 `null`**（仅匹配预留的
+  NULL 指针），之后传当前活动修订 id。服务端在**同一事务**内重读活动指针
+  并完成指针填充/切换、审计记录与旧规则镜像同步；指针已被他人改变时返回
+  **409**（`reason: "active-moved"`，附当前活动修订），整笔发布不发生。
+  因此两个并发的首版发布也只有一个成功，另一个得到 409。
 
-**生成草稿**（内容先经与 PUT 相同的规范化校验；草稿不会自动激活）：
+**生成草稿**（内容先经与 PUT 相同的规范化校验；草稿永不自动激活）：
 
 ```bash
 curl -sS -X POST "$BASE/v1/rulesets/acme/revisions" \
@@ -86,18 +104,33 @@ curl -sS -X POST "$BASE/v1/rulesets/acme/revisions" \
   "content_hash": "a1b2c3d4…（完整 64 位 SHA-256）",
   "base_revision": null,
   "created_at": "2026-09-28T10:00:00+00:00",
-  "active": true,
+  "active": false,
   "created": true,
   "ruleset": { …规范化后的完整规则… }
 }
 ```
 
-- 首次创建（`base_revision: null`）会直接成为活动修订；已有规则集再提交
-  相同内容返回 `"created": false`（内容去重）；新内容则返回
-  `"active": false` 的草稿。
-- `GET /v1/rulesets/{name}`（旧 GET）继续返回当前活动规则集，额外附带
-  `active_revision` 字段；旧 PUT 仍可用（等价于“以当前活动修订为基线、
-  无条件追加并激活”，相同内容为空操作）。
+- 首次创建（`base_revision: null`）只保存草稿；此时
+  `GET /v1/rulesets/acme` 为 404、历史为 `"active_revision": null`、
+  `activations` 为空数组。已有规则集再提交相同内容返回
+  `"created": false`（内容去重）；新内容始终返回 `"active": false` 的草稿，
+  直到显式激活。
+- **首次发布**（CAS 期望值为空）在同一事务内填充活动指针、写首条激活审计
+  （`previous_revision` 为 `null`）并同步旧镜像；发布后旧 GET、列表与命名
+  核算立即可见：
+
+```bash
+curl -sS -X POST "$BASE/v1/rulesets/acme/revisions/a1b2c3d4e5f60718/activate" \
+  -H 'Content-Type: application/json' \
+  -d '{"expected_active_revision": null}'
+# 200 {"revision": "a1b2c3d4e5f60718", "active_revision": "a1b2c3d4e5f60718",
+#      "activated": true, "previous_revision": null, "activated_at": "…"}
+```
+
+- 旧 GET（`GET /v1/rulesets/{name}`）在发布后继续返回当前活动规则集，额外
+  附带 `active_revision` 字段；旧 PUT 仍可用（已发布规则集等价于“以当前
+  活动修订为基线、无条件追加并激活”，相同内容为空操作；**对仅有草稿的名称
+  执行旧 PUT 即代其完成首次发布**，响应 `created: true`）。
 
 **并发发布（CAS）**：两个发布者各自先读活动修订，只有一人的
 `expected_active_revision` 仍匹配：
@@ -121,16 +154,22 @@ curl -sS -X POST "$BASE/v1/rulesets/acme/revisions/r3cccccccccccccc/activate" \
 # 落败方重新 GET 历史、合并/确认后，以新的活动修订为期望重试即可
 ```
 
-激活成功返回 `previous_revision`（事务开始时读到的活动修订，即被替换者）
-与 `activated_at`；重复激活当前已活动的修订是幂等空操作（`activated:
-false`，不新增审计记录）。目标修订不存在返回 404；缺少
-`expected_active_revision` 返回 400。
+**并发首版发布**：名称只有草稿（活动指针为 NULL）时，两个发布者都传
+`expected_active_revision: null`，同样只有一人成功，另一人得到
+`active_revision` 为已发布修订 id 的 409——首版发布不存在“无锁窗口”。
+
+激活成功返回 `previous_revision`（事务开始时读到的活动修订，即被替换者；
+首版发布时为 `null`）与 `activated_at`；重复激活当前已活动的修订是幂等
+空操作（`activated: false`，不新增审计记录）。目标修订不存在返回 404；
+缺少 `expected_active_revision` 字段或其值既非字符串也非 `null` 返回 400；
+在未发布规则集上使用非空期望值（或已发布后仍传 `null`）返回 409。
 
 **修订历史**：`GET /v1/rulesets/{name}/revisions` 返回
-`active_revision`、按创建顺序排列的全部 `revisions`（每条含完整
-`ruleset` 内容、`content_hash`、`base_revision`、`active` 标记、
-`created_at`）以及 `activations` 激活审计链（`revision` /
-`previous_revision` / `activated_at`）。
+`active_revision`（首版发布前为 `null`）、按创建顺序排列的全部
+`revisions`（每条含完整 `ruleset` 内容、`content_hash`、`base_revision`、
+`active` 标记、`created_at`）以及 `activations` 激活审计链（`revision` /
+`previous_revision` / `activated_at`；首版发布前为空数组）。名称完全不
+存在（连草稿都没有）时返回 404。
 
 **回滚**：旧修订仍是一条内容完整、哈希不变的不可变修订，**用同一个
 CAS 激活接口即可回滚**（无需也无法重建内容），回滚只新增一条激活审计，
@@ -156,7 +195,10 @@ curl -sS -X POST "$BASE/v1/rulesets/acme/revisions/r1bbbbbbbbbbbbbb/activate" \
 **旧库迁移**：升级后首次打开旧版 SQLite 时，每个现有 `rulesets` 行
 （即旧 PUT 写入的内容）原样成为该规则集的**首个活动修订**（修订 id 为
 其内容哈希，`base_revision` 为 `null`），可核验的旧评估记录补盖修订
-id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。
+id；旧 PUT/GET、既有评估快照与确认版语义全部保持不变。升级到草稿门禁
+版（schema 版本 3）时，`ruleset_active` 的活动指针列会被重建为可空，
+已存储的非空活动指针原样保留（旧数据不存在“未发布”状态），随后即可在
+新名称上走“先草稿、后发布”的流程。
 
 ### 提交核算 `POST /v1/assessments`
 
@@ -796,9 +838,9 @@ app/fulfillment.py    履约材料核算：义务实例展开、all/any 证据�
 app/schedule.py       义务截止日排期：RFC 3339/IANA 时区解析、日历日/工作日偏移、沿无环依赖反向收紧与收紧链还原
 app/responsibility.py 责任分工：责任项展开（制品级/组件级）、人员资格/容量/成本规范化、全局最优分工（穷举 + 最小费用流界的完备分支定界）、409 最佳部分方案与原因
 app/compare.py        核算对比：原子差异分解（稳定编号）、反事实回滚与全局最小归因集（按大小递增、ID 字典序完备枚举，非法中间状态不计命中）
-app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变修订/CAS 激活/激活审计的事务实现
+app/store.py          SQLite 持久化（WAL，写锁）、规则快照绑定与旧库核验式迁移、不可变草稿/首版发布门禁/CAS 激活/激活审计的事务实现
 app/server.py         ThreadingHTTPServer JSON 路由
-tests/selftest.py     271 项端到端自检（含修订、并发发布与回滚）
+tests/selftest.py     295 项端到端自检（含首版草稿发布门禁、并发首版发布、修订、并发发布与回滚）
 Dockerfile / docker-compose.yml / .dockerignore
 ```
 

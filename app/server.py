@@ -71,10 +71,19 @@ class Api:
             if rules is None:
                 raise NotFound("ruleset %r not found" % name)
             return {"name": name, "ruleset": rules}
-        active = next(r for r in history["revisions"] if r["active"])
+        if history["active_revision"] is None:
+            # The name only holds unpublished drafts: legacy GET must not
+            # read them, so behave as if the ruleset does not exist yet.
+            rules = self.store.get_ruleset(name)
+            if rules is None:
+                raise NotFound("ruleset %r not found" % name)
+        else:
+            rules = next(
+                r["ruleset"] for r in history["revisions"] if r["active"]
+            )
         return {
             "name": name,
-            "ruleset": active["ruleset"],
+            "ruleset": rules,
             "active_revision": history["active_revision"],
         }
 
@@ -89,7 +98,7 @@ class Api:
         if "base_revision" not in body:
             raise ClientError(
                 "revision request requires 'base_revision'"
-                " (null when creating the ruleset's first revision)"
+                " (null only when drafting a ruleset's very first revision)"
             )
         base_revision = body["base_revision"]
         if base_revision is not None and not isinstance(base_revision, str):
@@ -101,10 +110,15 @@ class Api:
     def activate_revision(self, name, revision, body):
         if not isinstance(body, dict):
             raise ClientError("request body must be a JSON object")
-        expected = body.get("expected_active_revision")
-        if not isinstance(expected, str) or not expected:
+        if "expected_active_revision" not in body:
             raise ClientError(
-                "activation requires a non-empty 'expected_active_revision' string"
+                "activation requires 'expected_active_revision'"
+                " (null publishes the ruleset's first revision)"
+            )
+        expected = body["expected_active_revision"]
+        if expected is not None and (not isinstance(expected, str) or not expected):
+            raise ClientError(
+                "'expected_active_revision' must be a non-empty string or null"
             )
         return self.store.activate_ruleset_revision(name, revision, expected)
 
